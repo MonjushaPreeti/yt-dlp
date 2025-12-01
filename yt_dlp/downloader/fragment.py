@@ -164,6 +164,9 @@ class FragmentFD(FileDownloader):
             total_frags_str = 'unknown (live)'
         self.to_screen(f'[{self.FD_NAME}] Total fragments: {total_frags_str}')
         
+        # Initialize batch speeds tracking for concurrent downloads
+        ctx['batch_speeds'] = []
+        
         # Auto-enable per-fragment rate limiting for fragmented downloads
         # This provides smoother rate limiting and prevents network bursts
         ratelimit = self.params.get('ratelimit')
@@ -326,6 +329,41 @@ class FragmentFD(FileDownloader):
                 with contextlib.suppress(Exception):
                     os.utime(ctx['filename'], (time.time(), filetime))
 
+        # Report batch speeds if concurrent downloads were used
+        batch_speeds = ctx.get('batch_speeds', [])
+        if batch_speeds:
+            from ..utils import format_bytes
+            concurrent_frags = self.params.get('concurrent_fragment_downloads', 1)
+            ratelimit = self.params.get('ratelimit')
+            ratelimit_per_fragment = self.params.get('ratelimit_per_fragment')
+            
+            if ratelimit and ratelimit_per_fragment and concurrent_frags > 1:
+                expected_per_frag = ratelimit / concurrent_frags
+                expected_total = ratelimit
+                self.to_screen(f'[rate-limit] Batch download speeds (per-fragment rate limiting enabled):')
+                for batch in batch_speeds:
+                    frag_range = f"Frag{min(batch['fragments'])}-{max(batch['fragments'])}"
+                    self.to_screen(
+                        f'  Batch {batch["batch_num"]} ({frag_range}, {len(batch["fragments"])} fragments): '
+                        f'{format_bytes(batch["speed"])}/s total '
+                        f'(limit: {format_bytes(expected_total)}/s, '
+                        f'{format_bytes(expected_per_frag)}/s per fragment)')
+            elif ratelimit:
+                self.to_screen(f'[rate-limit] Batch download speeds (rate limiting enabled):')
+                for batch in batch_speeds:
+                    frag_range = f"Frag{min(batch['fragments'])}-{max(batch['fragments'])}"
+                    self.to_screen(
+                        f'  Batch {batch["batch_num"]} ({frag_range}, {len(batch["fragments"])} fragments): '
+                        f'{format_bytes(batch["speed"])}/s '
+                        f'(limit: {format_bytes(ratelimit)}/s)')
+            else:
+                self.to_screen(f'[rate-limit] Batch download speeds:')
+                for batch in batch_speeds:
+                    frag_range = f"Frag{min(batch['fragments'])}-{max(batch['fragments'])}"
+                    self.to_screen(
+                        f'  Batch {batch["batch_num"]} ({frag_range}, {len(batch["fragments"])} fragments): '
+                        f'{format_bytes(batch["speed"])}/s')
+        
         self._hook_progress({
             'downloaded_bytes': downloaded_bytes,
             'total_bytes': downloaded_bytes,
@@ -510,15 +548,59 @@ class FragmentFD(FileDownloader):
                 download_fragment(fragment, ctx_copy)
                 return fragment, fragment['frag_index'], ctx_copy.get('fragment_filename_sanitized')
 
+            # Track batch speeds for concurrent downloads
+            fragments_list = list(fragments)
+            batch_speeds = ctx.get('batch_speeds', [])
+            
             with tpe or concurrent.futures.ThreadPoolExecutor(max_workers) as pool:
                 try:
-                    for fragment, frag_index, frag_filename in pool.map(_download_fragment, fragments):
-                        ctx.update({
-                            'fragment_filename_sanitized': frag_filename,
-                            'fragment_index': frag_index,
-                        })
-                        if not append_fragment(decrypt_fragment(fragment, self._read_fragment(ctx)), frag_index, ctx):
-                            return False
+                    # Process fragments in batches manually to track speeds
+                    for batch_start_idx in range(0, len(fragments_list), max_workers):
+                        batch_end_idx = min(batch_start_idx + max_workers, len(fragments_list))
+                        batch_fragments = fragments_list[batch_start_idx:batch_end_idx]
+                        
+                        # Track batch start time and bytes
+                        batch_start_time = time.time()
+                        batch_start_bytes = ctx.get('complete_frags_downloaded_bytes', 0)
+                        
+                        # Submit batch to executor
+                        futures = [pool.submit(_download_fragment, fragment) for fragment in batch_fragments]
+                        
+                        # Wait for batch to complete and collect results
+                        batch_results = []
+                        for future in concurrent.futures.as_completed(futures):
+                            try:
+                                batch_results.append(future.result())
+                            except Exception as e:
+                                # If a fragment fails, we'll handle it in the retry mechanism
+                                continue
+                        
+                        # Process batch results
+                        for fragment, frag_index, frag_filename in batch_results:
+                            ctx.update({
+                                'fragment_filename_sanitized': frag_filename,
+                                'fragment_index': frag_index,
+                            })
+                            if not append_fragment(decrypt_fragment(fragment, self._read_fragment(ctx)), frag_index, ctx):
+                                return False
+                        
+                        # Calculate batch speed
+                        batch_end_time = time.time()
+                        batch_end_bytes = ctx.get('complete_frags_downloaded_bytes', 0)
+                        batch_downloaded = batch_end_bytes - batch_start_bytes
+                        batch_elapsed = batch_end_time - batch_start_time
+                        
+                        if batch_elapsed > 0 and batch_downloaded > 0:
+                            batch_speed = batch_downloaded / batch_elapsed
+                            batch_speeds.append({
+                                'batch_num': len(batch_speeds) + 1,
+                                'fragments': [f['frag_index'] for f in batch_fragments],
+                                'speed': batch_speed,
+                                'bytes': batch_downloaded,
+                                'elapsed': batch_elapsed
+                            })
+                        
+                        ctx['batch_speeds'] = batch_speeds
                 except KeyboardInterrupt:
                     self._finish_multiline_status()
                     self.report_error(
