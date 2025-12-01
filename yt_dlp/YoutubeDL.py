@@ -55,6 +55,7 @@ from .networking.exceptions import (
 )
 from .networking.impersonate import ImpersonateRequestHandler, ImpersonateTarget
 from .plugins import directories as plugin_directories, load_all_plugins
+from .utils.queue_manager import PersistentQueue
 from .postprocessor import (
     EmbedThumbnailPP,
     FFmpegFixupDuplicateMoovPP,
@@ -636,6 +637,10 @@ class YoutubeDL:
         self._playlist_urls = set()
         self.cache = Cache(self)
         self.__header_cookies = []
+        
+        # Initialize persistent queue
+        queue_file = self.params.get('queue_file')
+        self.queue_manager = PersistentQueue(queue_file)
 
         # compat for API: load plugins if they have not already
         if not all_plugins_loaded.value:
@@ -3599,6 +3604,18 @@ class YoutubeDL:
 
     def download(self, url_list):
         """Download a given list of URLs."""
+        # Handle queue operations first
+        if self.params.get('queue_status'):
+            self.show_queue_status()
+            return 0
+        
+        if self.params.get('add_to_queue'):
+            self.add_to_queue(url_list)
+            return 0
+        
+        if self.params.get('process_queue'):
+            return self.process_queue()
+        
         url_list = variadic(url_list)  # Passing a single URL is a common mistake
         outtmpl = self.params['outtmpl']['default']
         if (len(url_list) > 1
@@ -4439,3 +4456,245 @@ class YoutubeDL:
             if ret and not write_all:
                 break
         return ret
+
+    def add_to_queue(self, urls):
+        """Add URLs to persistent queue"""
+        # Extract options from params that should be stored with queue item
+        options = {}
+        if self.params.get('format'):
+            options['format'] = self.params.get('format')
+        if self.params.get('outtmpl'):
+            options['outtmpl'] = self.params.get('outtmpl')
+        
+        added_count = 0
+        skipped_count = 0
+        
+        for url in urls:
+            item_id = self.queue_manager.add_item(url, options)
+            if item_id:
+                self.to_screen(f'Added to queue: {url} (ID: {item_id[:8]})')
+                added_count += 1
+            else:
+                existing_item = self.queue_manager.find_item_by_url(url, ['pending', 'downloading'])
+                if existing_item:
+                    self.to_screen(f'Skipped duplicate: {url} (already in queue as {existing_item.id[:8]})')
+                else:
+                    self.to_screen(f'Skipped: {url} (duplicate)')
+                skipped_count += 1
+        
+        if added_count > 0:
+            stats = self.queue_manager.get_queue_stats()
+            self.to_screen(f'Queue now contains {stats["total"]} items ({stats["pending"]} pending)')
+        
+        if skipped_count > 0:
+            self.to_screen(f'Skipped {skipped_count} duplicate URL(s)')
+
+    def show_queue_status(self):
+        """Show current queue status"""
+        # Reload queue from file to show latest status
+        self.queue_manager._load_queue()
+
+        stats = self.queue_manager.get_queue_stats()
+        if stats['total'] == 0:
+            self.to_screen('Queue is empty')
+            return
+
+        self.to_screen(self.queue_manager.get_queue_summary())
+
+        # Show pending items
+        pending_items = self.queue_manager.get_pending_items()
+        if pending_items:
+            self.to_screen('\nPending items:')
+            for i, item in enumerate(pending_items[:10], 1):  # Show first 10
+                self.to_screen(f'  {i}. [{item.id[:8]}] {item.url}')
+            if len(pending_items) > 10:
+                self.to_screen(f'  ... and {len(pending_items) - 10} more pending items')
+        
+        # Show failed items
+        failed_items = self.queue_manager.get_failed_items()
+        if failed_items:
+            self.to_screen('\nFailed items (use --queue-retry to retry):')
+            for i, item in enumerate(failed_items[:10], 1):  # Show first 10
+                error_msg = f' - {item.error_message}' if item.error_message else ''
+                retry_info = f' (retries: {item.retry_count})' if item.retry_count > 0 else ''
+                self.to_screen(f'  {i}. [{item.id[:8]}] {item.url}{error_msg}{retry_info}')
+            if len(failed_items) > 10:
+                self.to_screen(f'  ... and {len(failed_items) - 10} more failed items')
+
+    def process_queue(self):
+        """Download all URLs in queue"""
+        # Reload queue from file to get latest pending items
+        self.queue_manager._load_queue()
+        
+        pending_items = self.queue_manager.get_pending_items()
+        if not pending_items:
+            self.to_screen('Queue is empty (no pending items)')
+            return 0
+        
+        self.to_screen(f'Processing {len(pending_items)} pending items from queue...')
+        
+        # Process each pending URL in queue
+        for i, item in enumerate(pending_items, 1):
+            self.to_screen(f'[{i}/{len(pending_items)}] Downloading: {item.url} (ID: {item.id[:8]})')
+            
+            # Update status to downloading
+            self.queue_manager.update_item_status(item.id, 'downloading', started_at=dt.datetime.now().isoformat())
+            
+            # Apply stored options if any
+            original_params = {}
+            if item.options:
+                for key, value in item.options.items():
+                    original_params[key] = self.params.get(key)
+                    self.params[key] = value
+            
+            try:
+                # Temporarily disable queue operations to avoid recursion
+                queue_params = {}
+                for key in ['queue_status', 'add_to_queue', 'process_queue']:
+                    queue_params[key] = self.params.pop(key, None)
+                
+                result = self.download([item.url])
+                
+                # Restore queue params
+                for key, value in queue_params.items():
+                    if value is not None:
+                        self.params[key] = value
+                
+                # Restore original params
+                for key, value in original_params.items():
+                    if value is None:
+                        self.params.pop(key, None)
+                    else:
+                        self.params[key] = value
+                
+                if result == 0:
+                    self.queue_manager.update_item_status(
+                        item.id, 'completed',
+                        completed_at=dt.datetime.now().isoformat()
+                    )
+                    self.to_screen(f'[{i}/{len(pending_items)}] Completed: {item.url}')
+                else:
+                    self.queue_manager.update_item_status(
+                        item.id, 'failed',
+                        error_message='Download failed',
+                        retry_count=item.retry_count + 1
+                    )
+                    self.to_screen(f'[{i}/{len(pending_items)}] Failed: {item.url}')
+            except Exception as e:
+                self.queue_manager.update_item_status(
+                    item.id, 'failed',
+                    error_message=str(e),
+                    retry_count=item.retry_count + 1
+                )
+                self.to_screen(f'[{i}/{len(pending_items)}] Error: {item.url} - {e}')
+        
+        self.to_screen('Queue processing complete')
+        return 0
+
+    def clear_queue(self):
+        """Clear all items from queue"""
+        self.queue_manager.clear_queue()
+        self.to_screen('Queue cleared')
+
+    def remove_queue_items(self, item_ids):
+        """Remove specific items from queue"""
+        removed_count = 0
+        for item_id in item_ids:
+            if self.queue_manager.remove_item(item_id):
+                removed_count += 1
+                self.to_screen(f'Removed item: {item_id[:8]}')
+            else:
+                self.to_screen(f'Item not found: {item_id[:8]}')
+
+        if removed_count > 0:
+            self.to_screen(f'Removed {removed_count} items from queue')
+        else:
+            self.to_screen('No items removed')
+    
+    def retry_queue_items(self, item_ids):
+        """Retry specific failed items or all failed items"""
+        # Reload queue from file to get latest status
+        self.queue_manager._load_queue()
+        
+        if item_ids and 'all' in [id.lower() for id in item_ids]:
+            # Retry all failed items
+            count = self.queue_manager.retry_all_failed()
+            if count > 0:
+                self.to_screen(f'Reset {count} failed items to pending status')
+            else:
+                self.to_screen('No failed items to retry')
+            return
+        
+        # Retry specific items
+        retried_count = 0
+        for item_id in item_ids:
+            if self.queue_manager.retry_item(item_id):
+                retried_count += 1
+                self.to_screen(f'Reset item to pending: {item_id[:8]}')
+            else:
+                item = self.queue_manager.get_item(item_id)
+                if item is None:
+                    self.to_screen(f'Item not found: {item_id[:8]}')
+                elif item.status != 'failed':
+                    self.to_screen(f'Item {item_id[:8]} is not in failed status (current: {item.status})')
+                else:
+                    self.to_screen(f'Failed to retry item: {item_id[:8]}')
+        
+        if retried_count > 0:
+            self.to_screen(f'Reset {retried_count} items to pending status')
+        else:
+            self.to_screen('No items were reset')
+    
+    def load_queue_from_file(self, file_path):
+        """Load URLs from a text file and add them to the queue"""
+        from .utils import expand_path
+        
+        file_path = expand_path(file_path)
+        
+        if not os.path.exists(file_path):
+            self.report_error(f'Queue file not found: {file_path}')
+            return
+        
+        if not os.path.isfile(file_path):
+            self.report_error(f'Path is not a file: {file_path}')
+            return
+        
+        urls = []
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, start=1):
+                    # Strip whitespace
+                    line = line.strip()
+                    
+                    # Skip empty lines
+                    if not line:
+                        continue
+                    
+                    # Skip comment lines (lines starting with #)
+                    if line.startswith('#'):
+                        continue
+                    
+                    # Remove inline comments (everything after #)
+                    if '#' in line:
+                        line = line.split('#')[0].strip()
+                        if not line:
+                            continue
+                    
+                    # Add URL to list
+                    urls.append(line)
+        
+        except IOError as e:
+            self.report_error(f'Error reading queue file {file_path}: {e}')
+            return
+        except UnicodeDecodeError as e:
+            self.report_error(f'Error decoding queue file {file_path}: {e}. File must be UTF-8 encoded.')
+            return
+        
+        if not urls:
+            self.to_screen(f'No URLs found in file: {file_path}')
+            return
+        
+        self.to_screen(f'Loaded {len(urls)} URL(s) from file: {file_path}')
+        
+        # Add URLs to queue (duplicate detection is handled by add_to_queue)
+        self.add_to_queue(urls)
