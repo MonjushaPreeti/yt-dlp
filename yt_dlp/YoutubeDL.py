@@ -4644,3 +4644,57 @@ class YoutubeDL:
             self.to_screen(f'Reset {retried_count} items to pending status')
         else:
             self.to_screen('No items were reset')
+    
+    def load_queue_from_file(self, file_path):
+        """Load URLs from a text file and add them to the queue"""
+        from .utils import expand_path
+        
+        file_path = expand_path(file_path)
+        
+        if not os.path.exists(file_path):
+            self.report_error(f'Queue file not found: {file_path}')
+            return
+        
+        if not os.path.isfile(file_path):
+            self.report_error(f'Path is not a file: {file_path}')
+            return
+        
+        urls = []
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, start=1):
+                    # Strip whitespace
+                    line = line.strip()
+                    
+                    # Skip empty lines
+                    if not line:
+                        continue
+                    
+                    # Skip comment lines (lines starting with #)
+                    if line.startswith('#'):
+                        continue
+                    
+                    # Remove inline comments (everything after #)
+                    if '#' in line:
+                        line = line.split('#')[0].strip()
+                        if not line:
+                            continue
+                    
+                    # Add URL to list
+                    urls.append(line)
+        
+        except IOError as e:
+            self.report_error(f'Error reading queue file {file_path}: {e}')
+            return
+        except UnicodeDecodeError as e:
+            self.report_error(f'Error decoding queue file {file_path}: {e}. File must be UTF-8 encoded.')
+            return
+        
+        if not urls:
+            self.to_screen(f'No URLs found in file: {file_path}')
+            return
+        
+        self.to_screen(f'Loaded {len(urls)} URL(s) from file: {file_path}')
+        
+        # Add URLs to queue (duplicate detection is handled by add_to_queue)
+        self.add_to_queue(urls)

@@ -1996,6 +1996,11 @@ def create_parser():
         '--queue-retry', dest='queue_retry', metavar='ID', action='append',
         help='Retry specific failed item(s) by ID (can be used multiple times). Use "all" to retry all failed items')
     
+    queue_group.add_option(
+        '--load-queue-from-file', '--queue-load-file', dest='load_queue_from_file', metavar='FILE',
+        help='Load URLs from a text file (one URL per line) and add them to the queue. '
+             'Lines starting with # are treated as comments and ignored. Empty lines are skipped.')
+    
     parser.add_option_group(queue_group)
 
     return parser

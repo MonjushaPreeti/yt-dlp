@@ -992,6 +992,10 @@ def _real_main(argv=None):
         if opts.process_queue:
             return ydl.process_queue()
         
+        if opts.load_queue_from_file:
+            ydl.load_queue_from_file(opts.load_queue_from_file)
+            return 0
+        
         pre_process = opts.update_self or opts.rm_cachedir
         actual_use = all_urls or opts.load_info_filename
 
