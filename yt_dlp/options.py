@@ -1011,6 +1011,14 @@ def create_parser():
         dest='ratelimit', metavar='RATE',
         help='Maximum download rate in bytes per second, e.g. 50K or 4.2M')
     downloader.add_option(
+        '--global-rate-limit',
+        action='store_true', dest='global_rate_limit', default=None,
+        help='Use global rate limiter for concurrent fragment downloads (default: auto-enabled when --limit-rate and --concurrent-fragments > 1)')
+    downloader.add_option(
+        '--no-global-rate-limit',
+        action='store_false', dest='global_rate_limit',
+        help='Disable global rate limiting (use per-fragment rate limiting instead)')
+    downloader.add_option(
         '--throttled-rate',
         dest='throttledratelimit', metavar='RATE',
         help='Minimum download rate in bytes per second below which throttling is assumed and the video data is re-extracted, e.g. 100K')

@@ -836,6 +836,7 @@ def parse_options(argv=None):
         'force_generic_extractor': opts.force_generic_extractor,
         'allowed_extractors': opts.allowed_extractors or ['default'],
         'ratelimit': opts.ratelimit,
+        'global_rate_limit': opts.global_rate_limit,
         'throttledratelimit': opts.throttledratelimit,
         'overwrites': opts.overwrites,
         'retries': opts.retries,

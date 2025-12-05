@@ -163,15 +163,39 @@ class FragmentFD(FileDownloader):
         else:
             total_frags_str = 'unknown (live)'
         self.to_screen(f'[{self.FD_NAME}] Total fragments: {total_frags_str}')
+        
+        # Initialize global rate limiter for concurrent fragment downloads
+        # This provides accurate total bandwidth control across all download threads
+        ratelimit = self.params.get('ratelimit')
+        concurrent_frags = self.params.get('concurrent_fragment_downloads', 1)
+        use_global_rate_limit = self.params.get('global_rate_limit', None)
+        
+        # Auto-enable global rate limiting when:
+        # - Rate limit is set
+        # - Multiple fragments will download concurrently
+        # - User hasn't explicitly disabled it
+        global_rate_limiter = None
+        if ratelimit and concurrent_frags > 1:
+            if use_global_rate_limit is not False:  # None or True means enable
+                from .common import GlobalRateLimiter
+                global_rate_limiter = GlobalRateLimiter(ratelimit, logger=self)
+                ctx['global_rate_limiter'] = global_rate_limiter
+        
         self.report_destination(ctx['filename'])
-        dl = HttpQuietDownloader(self.ydl, {
+        
+        # Pass global rate limiter to HttpQuietDownloader
+        dl_params = {
             **self.params,
             'noprogress': True,
             'test': False,
             'sleep_interval': 0,
             'max_sleep_interval': 0,
             'sleep_interval_subtitles': 0,
-        })
+        }
+        if global_rate_limiter:
+            dl_params['global_rate_limiter'] = global_rate_limiter
+        
+        dl = HttpQuietDownloader(self.ydl, dl_params)
         tmpfilename = self.temp_name(ctx['filename'])
         open_mode = 'wb'
 

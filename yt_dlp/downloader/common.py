@@ -34,6 +34,89 @@ from ..utils import (
 from ..utils._utils import _ProgressState
 
 
+class GlobalRateLimiter:
+    """
+    Thread-safe global rate limiter for concurrent fragment downloads.
+    
+    Tracks total bytes downloaded across all threads and enforces
+    a global rate limit to prevent network bursts. This ensures that
+    the total bandwidth usage across all concurrent fragments never
+    exceeds the specified rate limit.
+    
+    Example:
+        limiter = GlobalRateLimiter(2*1024*1024)  # 2MB/s limit
+        # In each thread:
+        sleep_time = limiter.acquire(bytes_downloaded)
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+    """
+    
+    def __init__(self, rate_limit, logger=None):
+        """
+        Initialize the global rate limiter.
+        
+        @param rate_limit: Maximum bytes per second (global limit across all threads)
+        @param logger: Optional logger for info messages (FileDownloader instance)
+        """
+        self.rate_limit = float(rate_limit)
+        self.logger = logger
+        self.lock = threading.Lock()
+        self.total_bytes = 0
+        self.start_time = time.time()
+        self._info_shown = False
+    
+    def acquire(self, bytes_downloaded, fragment_start_time=None):
+        """
+        Record bytes downloaded and enforce rate limit.
+        
+        This method is thread-safe and should be called by each fragment
+        download thread after downloading a chunk of data.
+        
+        @param bytes_downloaded: Bytes downloaded in this chunk
+        @param fragment_start_time: Start time of this fragment (optional, for future use)
+        @return: sleep_time in seconds if throttling needed, else 0.0
+        """
+        if bytes_downloaded <= 0:
+            return 0.0
+        
+        with self.lock:
+            now = time.time()
+            self.total_bytes += bytes_downloaded
+            
+            # Show info message once (thread-safe check)
+            if not self._info_shown and self.logger:
+                self.logger.to_screen(
+                    f'[rate-limit] Global rate limiting enabled: '
+                    f'{format_bytes(self.rate_limit)}/s (shared across all fragments)')
+                self._info_shown = True
+            
+            # Calculate elapsed time since limiter started
+            elapsed = now - self.start_time
+            if elapsed <= 0.0:
+                return 0.0
+            
+            # Calculate current global speed
+            current_speed = float(self.total_bytes) / elapsed
+            
+            # If over limit, calculate sleep time needed
+            if current_speed > self.rate_limit:
+                # Calculate how long we should have taken at the rate limit
+                expected_time = float(self.total_bytes) / self.rate_limit
+                sleep_time = expected_time - elapsed
+                return max(0.0, sleep_time)
+            
+            return 0.0
+    
+    def reset(self):
+        """
+        Reset the rate limiter (for testing or reuse).
+        """
+        with self.lock:
+            self.total_bytes = 0
+            self.start_time = time.time()
+            self._info_shown = False
+
+
 class FileDownloader:
     """File Downloader class.
 
@@ -208,6 +291,20 @@ class FileDownloader:
         elapsed = now - start_time
         if elapsed <= 0.0:
             return
+        
+        # Check if global rate limiter is available (for concurrent fragments)
+        # This provides accurate total bandwidth control across all threads
+        global_rate_limiter = self.params.get('global_rate_limiter')
+        if global_rate_limiter:
+            # Use global rate limiter (thread-safe, shared across fragments)
+            # This ensures total bandwidth never exceeds limit, even with concurrent downloads
+            sleep_time = global_rate_limiter.acquire(byte_counter, start_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            return
+        
+        # Fall back to per-fragment rate limiting (original behavior)
+        # This is used for single-file downloads or when global limiter is not set
         speed = float(byte_counter) / elapsed
         if speed > rate_limit:
             sleep_time = float(byte_counter) / rate_limit - elapsed
